@@ -255,6 +255,131 @@ def label_states(B: np.ndarray, dx: float, dy: float) -> Dict:
             "unreached_px": int((labels[..., 0] == -999).sum())}
 
 
+# ── the non-ML reference: lines from the dense sensor image ───────────────
+
+# Two conventional detectors on the full dense charge-sensor scan, each with
+# its knobs.  Every setting is scanned on the validation devices and the best
+# one is applied, unchanged, to the test devices.
+#   canny:    (sigma, low quantile, high quantile, background px, dilate px,
+#              border px)
+#   gradient: (sigma, quantile, background px, dilate px, border px)
+DENSE_GRID = (
+    [("canny", s, lo, hi, bg, dil, b) for s in (1.0, 2.0)
+     for lo, hi in ((0.80, 0.90), (0.90, 0.95))
+     for bg in (0.0, 3.0, 6.0) for dil in (0, 1) for b in (0, 3)]
+    + [("gradient", s, q, bg, dil, b) for s in (0.7, 1.0, 1.5)
+       for q in (0.80, 0.85, 0.90, 0.93, 0.96)
+       for bg in (4.0, 8.0) for dil in (0, 1) for b in (0, 3)]
+    + [("steps", w, rel, q, thin, dil) for w in (5, 7) for rel in (0, 1)
+       for q in (0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
+       for thin in (0, 1) for dil in (0, 1)])
+
+
+def step_residual_map(Z: np.ndarray, w: int, rel: bool) -> np.ndarray:
+    """How much each pixel-to-pixel difference departs from its neighbours.
+
+    Along each axis: d = first difference, b = its running median over w
+    pixels (the smooth background slope of the sensor), residual |d - b|;
+    with rel, divided by |b| + median |d|, so a step counts relative to the
+    local slope.  A smooth background, however steep, leaves almost nothing;
+    a charge transition is a jump.  The larger of the two axes is kept.
+    """
+    from scipy.ndimage import median_filter
+    Z = np.asarray(Z, dtype=float)
+    Z = (Z - Z.min()) / (np.ptp(Z) or 1.0)
+    out = np.zeros(Z.shape)
+    for ax in (0, 1):
+        d = np.diff(Z, axis=ax)
+        b = median_filter(d, size=(w, 1) if ax == 0 else (1, w),
+                          mode="nearest")
+        r = np.abs(d - b)
+        if rel:
+            r = r / (np.abs(b) + np.median(np.abs(d)))
+        out = np.maximum(out, np.pad(r, [(0, 1), (0, 0)] if ax == 0
+                                     else [(0, 0), (0, 1)]))
+    return out
+
+
+def _reframe(E: np.ndarray, b: int) -> np.ndarray:
+    """Drop edges within b px of the frame, then run the edges found at
+    distance b straight out to the frame.
+
+    The sensor's own background is steepest at the frame, and a detector
+    draws the frame itself there; that line cuts a thin false region off
+    the corner.  Dropping the band removes it; extending the surviving
+    edges keeps the real lines closed onto the frame.
+    """
+    if not b:
+        return E
+    E = E.copy()
+    E[:b, :] = E[b, :]
+    E[-b:, :] = E[-b - 1, :]
+    E[:, :b] = E[:, b][:, None]
+    E[:, -b:] = E[:, -b - 1][:, None]
+    return E
+
+
+def dense_line_map(Z: np.ndarray, knob) -> np.ndarray:
+    """Binary line map from the dense sensor image Z (row = V_P2).
+
+    The route without a network, with every pixel measured.
+
+    canny     subtract a Gaussian-blurred copy (the sensor's smooth
+              background), scale by min and max, Canny with quantile
+              thresholds.
+    gradient  |grad Z| at scale sigma, minus its own Gaussian-blurred copy
+              (removes the smooth flank of the sensor peak, keeps the steps),
+              pixels above a quantile, thinned to one-pixel lines.
+
+    Quantile thresholds make one setting mean the same on every device.
+    Optional dilation closes one-pixel breaks.  Unlike slopes.canny_points,
+    edges at the frame are kept: removing them opens the gaps that merge two
+    regions.
+    """
+    from scipy.ndimage import gaussian_filter, gaussian_gradient_magnitude
+    from skimage.feature import canny
+    from skimage.morphology import skeletonize
+    Z = np.asarray(Z, dtype=float)
+    Z = (Z - Z.min()) / (np.ptp(Z) or 1.0)
+    if knob[0] == "canny":
+        _, s, lo, hi, bg, dil, b = knob
+        if bg:
+            Z = Z - gaussian_filter(Z, bg, mode="nearest")
+        E = canny(Z, sigma=s, low_threshold=lo, high_threshold=hi,
+                  use_quantiles=True, mode="nearest")
+    elif knob[0] == "gradient":
+        _, s, q, bg, dil, b = knob
+        G = gaussian_gradient_magnitude(Z, s, mode="nearest")
+        G = G - gaussian_filter(G, bg, mode="nearest")
+        E = skeletonize(G > np.quantile(G, q))
+    else:
+        _, w, rel, q, thin, dil = knob
+        R = step_residual_map(Z, w, bool(rel))
+        E = R > np.quantile(R, q)
+        if thin:
+            E = skeletonize(E)
+        b = 0
+    E = _reframe(E, b)
+    if dil:
+        E = ndimage.binary_dilation(E, iterations=dil)
+    return E
+
+
+def dense_knob(k) -> str:
+    if k[0] == "canny":
+        _, s, lo, hi, bg, dil, b = k
+        return (f"Canny sigma={s:g} q=({lo:g},{hi:g}) background={bg:g}px "
+                f"dilate={dil}px border={b}px")
+    if k[0] == "gradient":
+        _, s, q, bg, dil, b = k
+        return (f"gradient sigma={s:g} q={q:g} background={bg:g}px "
+                f"dilate={dil}px border={b}px")
+    _, w, rel, q, thin, dil = k
+    return (f"step residual window={w}px "
+            f"{'relative' if rel else 'absolute'} q={q:g} "
+            f"thin={'yes' if thin else 'no'} dilate={dil}px")
+
+
 # ── the metrics ───────────────────────────────────────────────────────────
 
 def keep_mask(Y: np.ndarray, tol: float = 1.0) -> np.ndarray:
@@ -499,7 +624,7 @@ def variation_table(rows: Sequence[Dict], out_base: str, caption: str):
 # ── figures ───────────────────────────────────────────────────────────────
 
 INK, MUTED = "#111111", "#555555"
-FULL_COLOR, UNET_COLOR = "#111111", "#2a78d6"
+FULL_COLOR, UNET_COLOR, DENSE_COLOR = "#111111", "#2a78d6", "#eb6834"
 LABEL_MIN_PX = 40        # regions smaller than this get no (n1, n2) text
 ERR_N1, ERR_N2, ERR_BOTH = (0.92, 0.45, 0.10), (0.16, 0.42, 0.84), (0.1,) * 3
 
@@ -667,8 +792,10 @@ def fig_vs_coverage(out_dir, summaries):
     """Fig. 3: relative pixel accuracy and state recall vs coverage."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 2, figsize=(7.0, 2.7), constrained_layout=True)
-    un = [s for s in summaries if s["method"] != "full CSD"]
+    un = [s for s in summaries if s["method"] == "U-Net"]
     full = [s for s in summaries if s["method"] == "full CSD"][0]
+    dense = [s for s in summaries
+             if s["method"] not in ("U-Net", "full CSD")]
     for a, k, lab in ((ax[0], "acc_rel", "pixel accuracy, relative (%)"),
                       (ax[1], "state_recall", "state recall (%)")):
         x = np.array([s["coverage_%"] for s in un])
@@ -680,6 +807,11 @@ def fig_vs_coverage(out_dir, summaries):
                label="full CSD, median")
         a.plot(100, full[k]["mean"], "+", color=FULL_COLOR, ms=7,
                label="full CSD, mean")
+        for d in dense:
+            a.plot(100, d[k]["median"], "D", color=DENSE_COLOR, ms=4.5,
+                   label=f"{d['method']}, median")
+            a.plot(100, d[k]["mean"], "x", color=DENSE_COLOR, ms=6,
+                   label=f"{d['method']}, mean")
         a.set_xscale("log")
         t = [1, 2, 5, 10, 20, 50, 100]
         a.set_xticks(t)
@@ -694,7 +826,8 @@ def fig_vs_coverage(out_dir, summaries):
     plt.close(fig)
 
 
-def fig_failures(out_dir, hist, lim, rows_full, rows_unet, label):
+def fig_failures(out_dir, hist, lim, rows_full, rows_unet, label,
+                 rows_dense=()):
     """Fig. 4: (dn1, dn2) of wrong pixels; accuracy vs states and d1d2."""
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
@@ -712,9 +845,12 @@ def fig_failures(out_dir, hist, lim, rows_full, rows_unet, label):
                     fontsize=6.5)
     for a, k, xl in ((ax[1], "n_states", "charge states in window"),
                      (ax[2], "d1d2", "$d_1d_2$ (interdot)")):
-        for rr, c, mk, nm in ((rows_full, FULL_COLOR, "s", "full CSD"),
-                              (rows_unet, UNET_COLOR, "o",
-                               f"U-Net {label}")):
+        series = [(rows_full, FULL_COLOR, "s", "full CSD"),
+                  (rows_unet, UNET_COLOR, "o", f"U-Net {label}")]
+        if rows_dense:
+            series.insert(1, (rows_dense, DENSE_COLOR, "D",
+                              rows_dense[0]["method"]))
+        for rr, c, mk, nm in series:
             a.plot([r[k] for r in rr], [100 * r["acc_rel"] for r in rr], mk,
                    ms=3, mfc="none", mec=c, mew=0.7, label=nm)
         a.set_xlabel(xl, fontsize=7)

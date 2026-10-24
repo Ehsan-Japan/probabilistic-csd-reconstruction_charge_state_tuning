@@ -34,6 +34,7 @@ import numpy as np
 import _common  # noqa: F401  (import path + headless plotting)
 from csdrecon.config import paths
 from csdrecon.ml import grid_train
+from csdrecon.ml.ray_peaks import load_grid
 from csdrecon.study import charge_states as C
 from run_7_virtual_gates import cells, model_dir, split_arrays
 
@@ -41,6 +42,7 @@ from run_7_virtual_gates import cells, model_dir, split_arrays
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = ["4-5-6-7-8_rays_40-50-60_points_500_samples",
         "4-6-8-12-16-24_rays_40-60-100_points_500_samples"]
+DENSE = "dense, no ML"               # the non-network reference row
 FIGURE_UNET = {                      # the U-Net shown in figs 2 and 4
     "4-6-8-12-16-24_rays_40-60-100_points_500_samples": "8_rays_40_points_500_samples",
     "4-5-6-7-8_rays_40-50-60_points_500_samples": "8_rays_60_points_500_samples"}
@@ -57,7 +59,33 @@ def local(sample):
     return paths.data_path("_device_pools", s[-2], s[-1])
 
 
-def run_split(run_dir, split):
+def choose_dense(dirs, Y, states, px, out):
+    """The dense detector's setting: best mean state recall on these
+    (validation) devices.  Every setting's scores go to dense_scan.csv."""
+    Z = [load_grid(d)[2] for d in dirs]
+    scan = []
+    for k in C.DENSE_GRID:
+        sc = [C.score(C.label_states(C.dense_line_map(Z[i], k), *px[i]),
+                      states[i], Y[i], *px[i]) for i in range(len(Y))]
+        scan.append({"setting": C.dense_knob(k),
+                     "state_recall": float(np.mean([s["state_recall"]
+                                                    for s in sc])),
+                     "acc_rel": float(np.mean([s["acc_rel"] for s in sc])),
+                     "knob": k})
+    best = max(scan, key=lambda r: (r["state_recall"], r["acc_rel"]))
+    with open(os.path.join(out, "dense_scan.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["setting", "state_recall_mean", "acc_rel_mean",
+                    "chosen"])
+        for r in sorted(scan, key=lambda r: -r["state_recall"]):
+            w.writerow([r["setting"], f"{r['state_recall']:.4f}",
+                        f"{r['acc_rel']:.4f}", int(r is best)])
+    print(f"  dense setting chosen on validation: {best['setting']} "
+          f"(recall {100 * best['state_recall']:.1f} %)")
+    return best["knob"]
+
+
+def run_split(run_dir, split, dense_knob=None, out=None):
     cl = cells(run_dir)
     _, Y, samples = split_arrays(os.path.join(run_dir, cl[0][0]), split)
     Y = Y.astype(bool)
@@ -80,6 +108,12 @@ def run_split(run_dir, split):
 
     for i in range(len(Y)):
         add("full CSD", "", "", Y[i], i, 1.0, "full")
+    if dense_knob is None:
+        dense_knob = choose_dense(dirs, Y, states, px, out)
+    maps[DENSE] = np.array([C.dense_line_map(load_grid(d)[2], dense_knob)
+                            for d in dirs])
+    for i in range(len(Y)):
+        add(DENSE, "", "", maps[DENSE][i], i, 1.0, DENSE)
     for name, rays, points in cl:
         X, _, sc = split_arrays(os.path.join(run_dir, name), split)
         assert [os.path.basename(local(s)) for s in sc] == names, name
@@ -93,6 +127,7 @@ def run_split(run_dir, split):
         print(f"  {split:10s} {name}: {md}, threshold {ck['threshold']}")
     ctx = {"dirs": dirs, "names": names, "info": info, "states": states,
            "px": px, "var": var, "maps": maps}
+    ctx["dense_knob"] = dense_knob
     return rows, hists, ctx
 
 
@@ -108,7 +143,7 @@ def summaries(rows):
               == (m, rays, points)]
         s = C.summary_row(rs)
         s.update(method=m, rays=rays, points=points,
-                 budget="—" if m == "full CSD" else f"{rays} × {points}")
+                 budget="—" if m != "U-Net" else f"{rays} × {points}")
         out.append(s)
     return out
 
@@ -148,15 +183,18 @@ def figures(out, summ, rows, hists, ctx, cell):
     C.fig_examples(fig_dir, picks)
     C.fig_vs_coverage(fig_dir, summ)
     full = [r for r in rows if r["method"] == "full CSD"]
+    dense = [r for r in rows if r["method"] == DENSE]
     C.fig_failures(fig_dir, hists[cell], WRONG_LIM, full, ur,
-                   f"{r_}×{p_}")
+                   f"{r_}×{p_}", dense)
     return [(p["label"], p["name"], p["score"]["acc_rel"]) for p in picks]
 
 
 def paragraph(summ, rows, cell):
     """The results paragraph, every number read from summ / rows."""
     full = summ[0]
-    un = sorted(summ[1:], key=lambda s: s["coverage_%"])
+    dn = next(s for s in summ if s["method"] == DENSE)
+    un = sorted([s for s in summ if s["method"] == "U-Net"],
+                key=lambda s: s["coverage_%"])
     lo, hi = un[0], un[-1]
     r_, p_ = int(cell.split("_")[0]), int(cell.split("_")[2])
     mid = next(s for s in un if (s["rays"], s["points"]) == (r_, p_))
@@ -188,19 +226,29 @@ def paragraph(summ, rows, cell):
         f"full CSD, with a centre error of "
         f"{mid['centre_err_11_mV']['median']:.3f} mV (median). The line "
         f"maps' self-consistency is {a(full, 'consistency'):.2f} for the "
-        f"full CSD and {a(mid, 'consistency'):.2f} for {mid['budget']}.")
+        f"full CSD and {a(mid, 'consistency'):.2f} for {mid['budget']}. "
+        f"Without a network, lines taken from the dense sensor image (every "
+        f"pixel measured, no noise) give {a(dn):.1f} % pixel accuracy, "
+        f"{a(dn, 'state_recall'):.1f} % state recall and (1,1) IoU "
+        f"{a(dn, 'iou_11'):.2f}.")
 
 
 def main():
     for run in RUNS:
         run_dir = os.path.join(ROOT, "results", run)
+        print(run)
+        if not os.path.isdir(run_dir):
+            print(f"  {run_dir} is missing -- skipped")
+            continue
         out = os.path.join(run_dir, "charge_states")
         os.makedirs(out, exist_ok=True)
-        print(run)
         rows, summ, ctx_test, hist_test = [], {}, None, None
-        for split, base in (("test", "summary"),
-                            ("validation", "summary_validation")):
-            rs, hs, ctx = run_split(run_dir, split)
+        knob = None
+        # validation first: it chooses the dense detector's setting
+        for split, base in (("validation", "summary_validation"),
+                            ("test", "summary")):
+            rs, hs, ctx = run_split(run_dir, split, knob, out)
+            knob = ctx["dense_knob"]
             rows += rs
             n = len(ctx["names"])
             C.variation_table(
@@ -229,7 +277,9 @@ def main():
             f.write(text + "\n\nFig. 2 devices (U-Net "
                     f"{FIGURE_UNET[run]}, relative pixel accuracy): "
                     + ", ".join(f"{a} {b} ({100 * c:.1f} %)"
-                                for a, b, c in picks) + "\n")
+                                for a, b, c in picks) + "\n"
+                    + "\nDense detector setting (chosen on the validation "
+                    f"devices by mean state recall): {C.dense_knob(knob)}\n")
         print(f"  wrote {out}")
 
 
