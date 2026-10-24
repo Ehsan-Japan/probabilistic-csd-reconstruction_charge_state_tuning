@@ -1,0 +1,385 @@
+"""
+evaluation.py — stage 3: score the checkpoint on the held-out devices and draw
+what it predicts.
+
+Writes into <config>/evaluation/: metrics.json, per_device.csv (one row per
+test device — the spread, not just the mean), results.txt, and figures/ with
+f1_vs_tolerance.png, probability.png and one sample_<i>/ folder per test
+device named in run_1's figure_devices["test"].
+
+Why the metrics are what they are: transition lines are one pixel wide and a
+few percent of the diagram, so pixel accuracy is useless (predicting no line
+anywhere already scores ~96%) and strict pixel F1 is unfairly harsh.  The
+headline is tolerant F1 at tau = 1, reported beside tau = 0, 2, 3.
+
+The binarisation threshold is not chosen here.  It was picked on the
+validation split during training and stored in the checkpoint, so nothing on
+this page was tuned on the test devices.
+"""
+import csv
+import json
+import os
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from ..ml import grid_train
+from ..config import log
+from ..ml.grid_metrics import (claimed_at_tau, coverage_at_tau,
+                               evaluate, iou, tolerant_f1)
+from .config import StudyConfig
+from .dataset import load_split
+
+TAUS = (0, 1, 2, 3)
+HEADLINE = "f1@1"
+
+INK = "#111111"
+MUTED = "#555555"
+LINE_C = "#1e7a3c"      # pixels that really are on a transition line
+
+
+# ── scoring ───────────────────────────────────────────────────────────────
+
+def per_device_rows(pred: np.ndarray, true: np.ndarray,
+                    sample_dirs: Optional[Sequence[str]] = None) -> List[Dict]:
+    """
+    One metrics row per test device.
+
+    ``sample`` is the device's own folder name, carried alongside the running
+    index so a row can always be traced back to the device that produced it —
+    the index is a position in this split, the name is the device.
+    """
+    names = [os.path.basename(s) for s in (sample_dirs or [])]
+    rows = []
+    for i, (p, t) in enumerate(zip(pred, true), 1):
+        row = {"device": i,
+               "sample": names[i - 1] if i <= len(names) else f"sample_{i}",
+               "true_line_pixels": int((t > 0.5).sum()),
+               "predicted_line_pixels": int((p > 0.5).sum()),
+               "iou": iou(p, t)}
+        for tau in TAUS:
+            m = tolerant_f1(p, t, tau)
+            row[f"precision@{tau}"] = m["precision"]
+            row[f"recall@{tau}"] = m["recall"]
+            row[f"f1@{tau}"] = m["f1"]
+            # what this device's own prediction claims at that tolerance,
+            # so the price can be averaged over devices with a spread rather
+            # than quoted as a single pooled number
+            row[f"claim@{tau}"] = claimed_at_tau(p, tau)
+            if tau == 0:
+                row["pixel_accuracy"] = m["accuracy"]
+        rows.append(row)
+    return rows
+
+
+def score(cfg: StudyConfig) -> Tuple[Dict, List[Dict], np.ndarray, np.ndarray,
+                                     np.ndarray, np.ndarray, List[str]]:
+    """
+    Load the checkpoint, predict on the test split, and measure.
+
+    -> (metrics, rows, X, Y, probabilities, predictions, sample folders)
+    """
+    if not os.path.isfile(cfg.checkpoint):
+        raise FileNotFoundError(
+            f"{os.path.abspath(cfg.checkpoint)} is missing — run "
+            f"run_2_train_model.py for this configuration first")
+
+    X, Y, sample_dirs = load_split(cfg.test_npz)
+    net, ck = grid_train.load(cfg.checkpoint)
+    threshold = float(ck["threshold"])
+
+    if (ck["n_rays"], ck["n_points"]) != (cfg.n_rays, cfg.n_points):
+        raise ValueError(
+            f"checkpoint was trained at {ck['n_rays']} rays x "
+            f"{ck['n_points']} points but this configuration is "
+            f"{cfg.n_rays} x {cfg.n_points}.  Scoring it here would compare a "
+            f"model against a measurement it never saw.")
+    trained_on = ck.get("sampling", "rays")
+    if trained_on != cfg.sampling:
+        raise ValueError(
+            f"checkpoint was trained on '{trained_on}' sampling but this "
+            f"configuration is '{cfg.sampling}'.  Same budget, different "
+            f"places: scoring it here would compare a model against a "
+            f"measurement it never saw.")
+
+    log.say(f"scoring {len(X)} held-out devices at {cfg.n_rays} rays x "
+            f"{cfg.n_points} points (threshold {threshold}, fixed during "
+            f"training)")
+
+    prob = grid_train.predict(net, X)
+    pred = prob > threshold
+    rows = per_device_rows(pred, Y, sample_dirs)
+
+    metrics = {
+        "configuration": cfg.name,
+        "n_rays": cfg.n_rays,
+        "n_points": cfg.n_points,
+        "sampling": cfg.sampling,
+        "n_measured_points": int(cfg.n_rays * cfg.n_points),
+        "n_train_devices": int(ck.get("n_train", 0)),
+        "n_test_devices": int(len(X)),
+        "threshold": threshold,
+        "coverage": float(X[:, 1].mean()),
+        # How far the MEASUREMENT reaches at each tolerance the score is read
+        # at: the fraction of the plane within tau pixels of a measured pixel.
+        # coverage@0 is the plain coverage above.
+        **{f"coverage@{tau}": float(np.mean(
+            [coverage_at_tau(v, tau) for v in X[:, 1]])) for tau in TAUS},
+        "true_line_fraction": float(Y.mean()),
+        "predicted_line_fraction": float(pred.mean()),
+        **evaluate(pred, Y, taus=TAUS),
+    }
+    for key in ("f1", "precision", "recall"):
+        vals = np.array([r[f"{key}@1"] for r in rows])
+        metrics[f"{key}@1_std"] = float(vals.std())
+        metrics[f"{key}@1_min"] = float(vals.min())
+        metrics[f"{key}@1_max"] = float(vals.max())
+    # The PRICE of the tolerance, per device then averaged: the fraction of
+    # the plane the prediction claims once dilated by tau.  The spread is
+    # kept because it is large -- line density varies several-fold across the
+    # test set, and so does the area the model's answer covers.
+    for tau in TAUS:
+        vals = np.array([r[f"claim@{tau}"] for r in rows])
+        metrics[f"claim@{tau}"] = float(vals.mean())
+        metrics[f"claim@{tau}_std"] = float(vals.std())
+    return metrics, rows, X, Y, prob, pred, sample_dirs
+
+
+# ── figures ───────────────────────────────────────────────────────────────
+
+def _blank(ax):
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color("#bbbbbb")
+
+
+def _device_extent(sample_dir: str):
+    """
+    [vxmin, vxmax, vymin, vymax] of the device the arrays came from, or None.
+
+    The npz carries pixels only, so the gate voltages are read back from the
+    device folder the sample came from.  If that folder has been moved or the
+    pool deleted, the panels still draw — just without a voltage scale.
+    """
+    from .device_figures import _extent, load_device
+
+    try:
+        ux, uy, _, _ = load_device(sample_dir)
+    except Exception:
+        return None
+    return _extent(ux, uy)
+
+
+def _panel(out_path: str, draw, title: str, extent=None):
+    """
+    One square map, on its own, saved as its own file.
+
+    With ``extent`` the panel gets the same labelled voltage axes as every
+    other figure in the study, so a prediction can be laid next to the
+    device's stability diagram and read at the same scale; without it the
+    frame is left blank rather than showing meaningless pixel indices.
+    """
+    from ..config.figure_style import apply_voltage_axes
+
+    fig, ax = plt.subplots(figsize=(4.6, 4.8))
+    draw(ax)
+    if extent is None:
+        _blank(ax)
+    else:
+        apply_voltage_axes(ax, *extent)
+    ax.set_title(title, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def render_device_panels(X, Y, pred, prob, rows, sample_dirs, cfg,
+                         fig_dir: str) -> int:
+    """One folder per chosen test device, each panel its own file.
+
+        evaluation/figures/sample_1/
+            measurement.png     what the network was given
+            ground_truth.png    what it should draw
+            prediction.png      what it drew
+
+    Which devices is run_1's figure_devices["test"], the same list that
+    decides the stability-diagram pictures, so one set of devices is followed
+    through the whole study.  Devices are matched by name, not by position:
+    only the folder name identifies the device.
+    """
+    from .device_figures import normalise_devices
+
+    wanted = normalise_devices(cfg.figure_devices.get("test"))
+    names = [os.path.basename(s) for s in sample_dirs]
+    if wanted is None:
+        picks = list(range(len(names)))
+    else:
+        by_name = {n: i for i, n in enumerate(names)}
+        picks, missing = [], []
+        for number in wanted:
+            key = f"sample_{int(number)}"
+            (picks.append(by_name[key]) if key in by_name
+             else missing.append(key))
+        if missing:
+            log.detail(f"  [note] not in this test split: {', '.join(missing)}")
+    if not picks:
+        return 0
+
+    cm = plt.get_cmap("inferno").copy()
+    cm.set_bad("white")
+    written = 0
+    for i in picks:
+        out = os.path.join(fig_dir, names[i])
+        os.makedirs(out, exist_ok=True)
+        row = rows[i]
+        tag = f"{names[i]}  —  F1@1 {row[HEADLINE]:.3f}"
+
+        visited = X[i, 1] > 0.5
+        ext = _device_extent(sample_dirs[i])
+        _panel(os.path.join(out, "measurement.png"),
+               lambda ax: ax.imshow(np.where(visited, X[i, 0], np.nan),
+                                    origin="lower", cmap=cm, vmin=0, vmax=1,
+                                    extent=ext, aspect="auto",
+                                    interpolation="nearest"),
+               f"measurement — {cfg.n_rays} rays x {cfg.n_points} points"
+               f"\n{tag}", ext)
+        _panel(os.path.join(out, "ground_truth.png"),
+               lambda ax: ax.imshow(1 - (Y[i] > 0.5), origin="lower",
+                                    cmap="gray", extent=ext, aspect="auto",
+                                    interpolation="nearest"),
+               f"ground truth\n{tag}", ext)
+        _panel(os.path.join(out, "prediction.png"),
+               lambda ax: ax.imshow(1 - pred[i], origin="lower", cmap="gray",
+                                    extent=ext, aspect="auto",
+                                    interpolation="nearest"),
+               f"U-Net prediction\n{tag}", ext)
+        written += 3
+    log.detail(f"  per-device panels for {len(picks)} device(s): "
+               f"{', '.join(names[i] for i in picks)}")
+    return written
+
+
+def fig_f1_vs_tolerance(metrics: Dict, out_path: str, cfg: StudyConfig):
+    fig, ax = plt.subplots(figsize=(5.6, 4))
+    for key, color, label in (("f1", "#1f5fa8", "F1"),
+                              ("precision", "#7d3c98", "precision"),
+                              ("recall", "#c0392b", "recall")):
+        ax.plot(TAUS, [metrics[f"{key}@{t}"] for t in TAUS], "o-",
+                color=color, lw=1.8, ms=5, label=label)
+    ax.set_xlabel("tolerance tau (pixels)")
+    ax.set_ylabel("score on the held-out devices")
+    ax.set_xticks(list(TAUS))
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25, lw=0.6)
+    ax.legend(frameon=False, fontsize=9)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_title(f"{cfg.n_rays} rays x {cfg.n_points} points", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def fig_probability(prob, Y, threshold: float, out_path: str,
+                    cfg: StudyConfig):
+    """
+    The network outputs a probability per pixel; the threshold is what turns
+    it into a picture.  Showing the map itself, before any cut is made, keeps
+    the two separate: a low F1 caused by a badly placed threshold looks
+    nothing like one caused by a network that cannot see the lines.
+    """
+    fig, ax = plt.subplots(figsize=(4.8, 3.8))
+    im = ax.imshow(prob[0], origin="lower", cmap="magma", vmin=0, vmax=1,
+                   interpolation="nearest")
+    ax.set_title(f"probability map, device 1  (threshold {threshold:g})",
+                 fontsize=9)
+    _blank(ax)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+# ── the whole of stage 3 ──────────────────────────────────────────────────
+
+def _results_text(cfg: StudyConfig, metrics: Dict, rows: List[Dict]) -> str:
+    lines = [
+        "=" * 72,
+        f"HELD-OUT RESULTS — {cfg.name}",
+        "=" * 72,
+        "",
+        f"  measurement budget      {cfg.n_rays} rays x {cfg.n_points} points",
+        f"  grid actually measured  {100 * metrics['coverage']:.3f}%",
+        f"  training devices        {metrics['n_train_devices']}",
+        f"  held-out devices        {metrics['n_test_devices']}  "
+        f"(held-out device IDs — see dataset_summary.txt)",
+        f"  threshold               {metrics['threshold']:g}  "
+        f"(fixed on the validation split during training)",
+        "",
+        "  tolerant scores (a predicted line pixel counts if a true one lies",
+        "  within tau pixels).  tau = 1 is the headline number.",
+        "",
+        "  coverage@tau is how far the MEASUREMENT reaches at that tolerance:",
+        "  the fraction of the plane within tau pixels of a measured pixel.",
+        "  The rest of the plane is inferred, not interpolated.",
+        "",
+        f"  {'tau':>5}{'precision':>12}{'recall':>10}{'F1':>10}"
+        f"{'coverage@tau':>15}",
+    ]
+    for tau in TAUS:
+        lines.append(f"  {tau:>5}{metrics[f'precision@{tau}']:>12.4f}"
+                     f"{metrics[f'recall@{tau}']:>10.4f}"
+                     f"{metrics[f'f1@{tau}']:>10.4f}"
+                     f"{100 * metrics[f'coverage@{tau}']:>14.3f}%")
+    lines += [
+        "",
+        f"  strict IoU              {metrics['iou']:.4f}",
+        f"  pixel accuracy          {metrics['accuracy@0']:.4f}   "
+        f"(uninformative — see below)",
+        "",
+        f"  F1@1 across devices     mean {metrics['f1@1']:.4f}  "
+        f"sd {metrics['f1@1_std']:.4f}  "
+        f"min {metrics['f1@1_min']:.4f}  max {metrics['f1@1_max']:.4f}",
+        f"  line pixels             true {100 * metrics['true_line_fraction']:.2f}%"
+        f"   predicted {100 * metrics['predicted_line_fraction']:.2f}%",
+        "",
+        "  Pixel accuracy is reported only to be dismissed: transition lines",
+        "  are a few percent of the diagram, so predicting no line anywhere",
+        f"  already scores {100 * (1 - metrics['true_line_fraction']):.1f}%.",
+        "",
+        "=" * 72,
+    ]
+    return "\n".join(lines)
+
+
+def run(cfg: StudyConfig) -> Dict:
+    """Score, write every file, return the metrics."""
+    metrics, rows, X, Y, prob, pred, sample_dirs = score(cfg)
+
+    out = cfg.eval_dir
+    fig_dir = os.path.join(out, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    with open(os.path.join(out, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    with open(os.path.join(out, "per_device.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    text = _results_text(cfg, metrics, rows)
+    with open(os.path.join(out, "results.txt"), "w") as f:
+        f.write(text)
+    log.detail("\n" + text)
+
+    fig_f1_vs_tolerance(metrics, os.path.join(fig_dir, "f1_vs_tolerance.png"),
+                        cfg)
+    fig_probability(prob, Y, metrics["threshold"],
+                    os.path.join(fig_dir, "probability.png"), cfg)
+    render_device_panels(X, Y, pred, prob, rows, sample_dirs, cfg, fig_dir)
+    log.detail(f"figures -> {os.path.abspath(fig_dir)}")
+    return metrics

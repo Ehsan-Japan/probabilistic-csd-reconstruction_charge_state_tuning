@@ -1,0 +1,246 @@
+"""
+grid_train.py — training and checkpointing for RayToLinesNet.  LIBRARY ONLY.
+
+There is no command line here on purpose: generation, training and evaluation
+are separate programs in scripts/, so a checkpoint is scored by code that
+cannot accidentally have seen the test data and a re-score never silently
+retrains.
+
+Line pixels are a few percent of the diagram, so the loss is BCE with the
+positive class weighted by its true rarity.  Without that the network
+converges instantly to "no lines anywhere" and never leaves.
+"""
+import os
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .grid_metrics import evaluate
+from ..config import log
+from .grid_model import RayToLinesNet
+from .ray_peaks import NET_CHANNELS
+
+# Thresholds scanned on the validation split to turn probabilities into a
+# binary map.  A single fixed 0.5 is the wrong choice here: the class weight
+# deliberately pushes probabilities up, and the best operating point shifts
+# with how sparse the measurement is.  The range runs high because a confident
+# network can put almost every pixel above 0.8 and still be perfectly
+# separable — cutting the scan off there would throw that away.
+THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+
+# Ceiling on the positive-class weight.  The true imbalance is ~1:30, and
+# using it raw makes "call everything a line" the cheapest early minimum: the
+# network settles there, stops depending on its input at all, and every
+# measurement budget then scores the same.  Capping keeps the nudge without
+# the collapse.
+MAX_POS_WEIGHT = 8.0
+
+# Optimiser settings.  Here, once, instead of in every script's settings
+# block: the budget study only needs them identical in every cell.
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-3
+VAL_FRACTION = 0.15      # of the TRAINING devices, never of the test set
+# Largest gradient norm one step may apply; None = no clipping.
+# Added 2026-10-23.  Without it a single bad step sometimes threw a run back
+# onto the early plateau (loss ~1.7, validation F1@1 ~0.42), where it stayed
+# for the remaining epochs -- the "collapsed" cells of the 2026-09 sweep, and
+# eight of the first nine runs of the 4-24-ray sweep.  On 8 x 40 and 4 x 40
+# it took 12 runs of 12 to convergence, with validation F1@1 spread over
+# seeds of 0.003 and 0.007, against roughly half collapsing without it.
+GRAD_CLIP = 1.0
+SEED = 0
+
+
+def training_description(seed: int = SEED) -> Dict:
+    """
+    The training hyperparameters as a record for models_info.json.  These are
+    the constants above — identical in every cell of a sweep — written out so
+    a run folder explains, on its own, how its models were trained.
+
+    `seed` is the only one that is deliberately varied: repeating an arm at
+    several training seeds is how the spread of the random initialisation is
+    measured instead of being mistaken for a result.
+    """
+    return {
+        "optimizer": "Adam",
+        "learning_rate": LEARNING_RATE,
+        "batch_size": BATCH_SIZE,
+        "val_fraction": VAL_FRACTION,
+        "seed": seed,
+        "loss": ("BCEWithLogits (positive class weighted by its rarity, "
+                 f"capped at {MAX_POS_WEIGHT}) + soft Dice"),
+        "max_pos_weight": MAX_POS_WEIGHT,
+        "grad_clip_norm": GRAD_CLIP,
+        "threshold_scan": list(THRESHOLDS),
+        "model_selection": ("epoch with best validation F1@1; binarisation "
+                            "threshold picked on the validation split, "
+                            "carved out of the training set"),
+    }
+
+
+def _soft_dice(logits: torch.Tensor, target: torch.Tensor,
+               eps: float = 1.0) -> torch.Tensor:
+    """
+    1 - Dice, computed on probabilities.
+
+    Weighted BCE alone judges pixels one at a time, so a blanket of positives
+    is only mildly penalised.  Dice is a ratio over the whole map: covering
+    everything blows up the denominator and is punished immediately.  That is
+    what stops the "all lines" collapse, and it is the standard loss for thin
+    structures for exactly this reason.
+    """
+    p = torch.sigmoid(logits).flatten(1)
+    t = target.flatten(1)
+    inter = (p * t).sum(1)
+    return (1 - (2 * inter + eps) / (p.sum(1) + t.sum(1) + eps)).mean()
+
+
+def device() -> torch.device:
+    """
+    The GPU when there is one, the CPU otherwise.
+
+    One place, so training, thresholding and scoring all agree.  Nothing
+    about the study depends on which it is: the same seeds, the same data
+    and the same architecture give the same model up to floating-point
+    reassociation.
+    """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def predict(net, X: np.ndarray, batch: int = 16) -> np.ndarray:
+    """
+    Per-pixel probabilities for a stack of inputs.
+
+    X may carry extra channels (the peaks channel the baseline uses); the
+    network is only ever shown the measurement — signal + visited.
+    """
+    net.eval()
+    dev = next(net.parameters()).device
+    Xn = X[:, :NET_CHANNELS]
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(Xn), batch):
+            xb = torch.tensor(Xn[i:i + batch]).to(dev)
+            out.append(torch.sigmoid(net(xb)).cpu().numpy())
+    return np.concatenate(out)
+
+
+def best_threshold(prob: np.ndarray, Y: np.ndarray, tau: float = 1.0):
+    """Threshold maximising tolerant F1 on the given maps."""
+    best_t, best_f1 = 0.5, -1.0
+    for t in THRESHOLDS:
+        f1 = evaluate(prob > t, Y, taus=(tau,))[f"f1@{tau}"]
+        if f1 > best_f1:
+            best_t, best_f1 = t, f1
+    return best_t, best_f1
+
+
+def train(X: np.ndarray, Y: np.ndarray, epochs: int = 40,
+          verbose: bool = True,
+          seed: int = SEED) -> Tuple[RayToLinesNet, float, Dict]:
+    """Fit the network on one budget's (X, Y) -> (net, threshold, history).
+
+    history is one value per epoch, {"train_loss": [...], "val_f1": [...]}, so
+    the curves of different budgets can be compared afterwards.
+
+    Test data never enters this function: the validation slice that picks the
+    epoch and the threshold is carved out of the training set.
+
+    `seed` is the training dice — the initial weights and the batch order.
+    Two runs differing only in it see the same data and land in slightly
+    different places, and that spread is what says whether a gap between two
+    arms is a result.  The validation slice is deliberately not drawn from it:
+    it stays pinned to SEED, so every seed of an arm is scored against the
+    same validation devices.
+    """
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(SEED)      # the val slice, fixed across seeds
+
+    idx = rng.permutation(len(X))
+    n_val = max(1, int(VAL_FRACTION * len(X)))
+    vi, ti = idx[:n_val], idx[n_val:]
+    Xv, Yv = X[vi], Y[vi]
+    dev = device()
+    Xt = torch.tensor(X[ti][:, :NET_CHANNELS]).to(dev)
+    Yt = torch.tensor(Y[ti]).to(dev)
+
+    net = RayToLinesNet(in_channels=NET_CHANNELS).to(dev)
+    pos = float(Y.mean())
+    pos_w = min((1 - pos) / max(pos, 1e-6), MAX_POS_WEIGHT)
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_w], device=dev))
+
+    def loss_fn(logits, target):
+        # BCE gets the pixels right, Dice keeps the prediction from spreading
+        # over the whole map.  Neither alone is enough for one-pixel lines.
+        return bce(logits, target) + _soft_dice(logits, target)
+
+    opt = torch.optim.Adam(net.parameters(), lr=LEARNING_RATE)
+
+    if verbose:
+        log.detail(f"  training on {dev.type}")
+        log.detail(f"  {net.n_params/1e3:.0f}k params, "
+                   f"{len(Xt)} train / {len(Xv)} val, positives {100*pos:.2f}%")
+
+    history = {"train_loss": [], "val_f1": []}
+    best_f1, best_state = -1.0, None
+    for ep in range(1, epochs + 1):
+        net.train()
+        perm = torch.randperm(len(Xt), device=dev)
+        tot = 0.0
+        for b in range(0, len(Xt), BATCH_SIZE):
+            sl = perm[b:b + BATCH_SIZE]
+            opt.zero_grad()
+            loss = loss_fn(net(Xt[sl]), Yt[sl])
+            loss.backward()
+            if GRAD_CLIP is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP)
+            opt.step()
+            tot += float(loss.detach()) * len(sl)
+        _, f1 = best_threshold(predict(net, Xv), Yv)
+        history["train_loss"].append(tot / len(Xt))
+        history["val_f1"].append(float(f1))
+        if verbose:
+            log.detail(f"  epoch {ep:3d}  loss {tot/len(Xt):.4f}  val F1@1 {f1:.3f}")
+        if f1 > best_f1:
+            best_f1 = f1
+            best_state = {k: v.clone() for k, v in net.state_dict().items()}
+
+    net.load_state_dict(best_state)
+    thr, _ = best_threshold(predict(net, Xv), Yv)
+
+    # A collapsed network scores the same at every measurement budget, which
+    # is the one failure that would quietly ruin the whole sweep.  Say so
+    # rather than writing a checkpoint that looks fine.
+    frac = float((predict(net, Xv) > thr).mean())
+    if frac > 0.5 or frac < 1e-4:
+        log.warn(f"  WARNING: model predicts {100*frac:.1f}% of pixels as lines "
+                 f"(truth is {100*pos:.1f}%) — it has collapsed to a constant "
+                 f"and is ignoring its input.  More devices or more epochs.")
+    return net, thr, history
+
+
+def save(net, threshold: float, path: str, n_rays: int, n_points: int,
+         extra: Optional[Dict] = None) -> None:
+    """
+    Write a checkpoint that remembers the budget it was trained for.
+
+    evaluate_model.py reads n_rays / n_points back out and measures the test
+    samples at exactly that budget — so a checkpoint can never be scored on a
+    measurement it was not trained for.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    state = {k: v.cpu() for k, v in net.state_dict().items()}
+    torch.save({"state_dict": state, "threshold": threshold,
+                "n_rays": n_rays, "n_points": n_points,
+                **(extra or {})}, path)
+
+
+def load(path: str) -> Tuple[RayToLinesNet, Dict]:
+    """(net in eval mode, checkpoint metadata) — the inverse of save()."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    net = RayToLinesNet()
+    net.load_state_dict(ck["state_dict"])
+    net.eval()
+    return net.to(device()), ck

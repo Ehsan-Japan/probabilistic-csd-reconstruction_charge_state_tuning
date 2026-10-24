@@ -1,0 +1,74 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+
+# --- Generated: reproducible from the code in this repo ---
+/data/
+/results/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+
+# --- Working notes for the next session, not part of the public repo ---
+HANDOFF.md
+CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
+
+# --- Reference material and figure sources, not part of the public repo ---
+# They live outside the repo, in ../csd-materials/ (other people's papers,
+# and the Illustrator .ai/.jsx sources).  Listed here so a stray copy back
+# into the working tree is never committed by accident; the figures the
+# README shows are copied into docs/figures/ instead.
+/csd-materials/
+/literature/
+/citations/
+/illustrator/
+
+# --- Manuscript drafts: machinery, history and hand-edited copies ---
+# The parts under paper_figures/method_docs/ are rebuilt from
+# make_method_docs.py; what a run leaves behind to protect a hand edit is
+# working state, not the manuscript.
+paper_figures/method_docs/.build/
+paper_figures/method_docs/.build_state.json
+paper_figures/method_docs/*/backups/
+paper_figures/method_docs/*/*_rebuilt.docx
+~$*.docx
+
+# Papers dropped in to cite from -- publisher PDFs, never ours to publish.
+# The folder and its note stay; the PDFs do not.
+paper_figures/method_docs/*/*_citations/*
+!paper_figures/method_docs/*/*_citations/README.txt
+# superseded documents moved aside, not deleted (2026-09-26)
+paper_figures/method_docs/_trash/
+
+# Other publishers' papers dropped into the project root -- never ours to
+# publish (2026-09-27)
+/RF-Squad.pdf
+/QArray_A_physics-informed_GPU-accelerated_simulato.pdf
+/qdarts.pdf
+/Qdsim.pdf
+
+# --- Manuscript and journal templates: kept locally, never pushed (2026-10-24) ---
+/paper_figures/method_docs/
+/paper_figures/templates/
+
+# --- Private correspondence, drafts, talks and agent notes in the root: never pushed (2026-10-24) ---
+/Fujita_*.docx
+/Fujita_*.txt
+/Manuscript_final.docx
+/SSDMpresentation_*.pdf
+/CLAUDE_*.md
+/image.jpg
